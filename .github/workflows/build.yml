@@ -1,0 +1,77 @@
+name: ESP32-C6 Test Firmware CI
+
+on:
+  push:
+    branches: [ "main" ]
+    tags:     [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & merge (ESP-IDF v5.4 / esp32c6)
+    runs-on: ubuntu-latest
+    # 需要写权限才能把产物推到 firmware 分支
+    permissions:
+      contents: write
+    container:
+      image: espressif/idf:release-v5.4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set target
+        run: idf.py set-target esp32c6
+
+      - name: Build
+        run: idf.py build
+
+      - name: Size report
+        run: idf.py size
+
+      # 合成「从 0x0 直接烧」的整包：bootloader + 分区表 + 应用
+      - name: Merge into single flash image
+        run: |
+          cd build
+          APP=$(ls *.bin | grep -v -E 'bootloader|partition' | head -1)
+          echo "app = $APP"
+          esptool.py --chip esp32c6 merge-bin \
+            --flash_mode dio --flash_freq 80m --flash_size 4MB \
+            -o ../esp32c6-test-fw-merged.bin \
+            0x0    bootloader/bootloader.bin \
+            0x8000 partition_table/partition-table.bin \
+            0x10000 "$APP"
+          cd ..
+          ls -lh esp32c6-test-fw-merged.bin
+          sha256sum esp32c6-test-fw-merged.bin
+
+      - name: Upload merged firmware (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32c6-test-fw-merged
+          path: esp32c6-test-fw-merged.bin
+          if-no-files-found: error
+
+      # 把固件推到独立的 orphan 分支，便于通过 API 分片取回
+      - name: Publish firmware to orphan branch
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan firmware
+          git rm -rf . --quiet || true
+          rm -rf .github main build CMakeLists.txt README.md sdkconfig.defaults
+          mkdir -p fw
+          cp esp32c6-test-fw-merged.bin fw/firmware.bin
+          cd fw
+          split -b 700k -d -a 3 firmware.bin firmware.bin.part-
+          rm firmware.bin
+          sha256sum firmware.bin.part-* > SHA256SUMS
+          ls -lh
+          cd ..
+          git add -f fw
+          git commit -m "firmware: ${GITHUB_SHA} (${GITHUB_RUN_ID})"
+          git push -f origin firmware
+          echo "published"
