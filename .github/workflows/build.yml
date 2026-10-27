@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build & merge (ESP-IDF v5.4 / esp32c6)
+    name: Build (ESP-IDF v5.4 / esp32c6)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -21,7 +21,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Actions 的 container: 会绕过镜像 entrypoint，export.sh 不会自动加载
       - name: Setup IDF environment
         run: |
           set -e
@@ -31,20 +30,12 @@ jobs:
           for p in /opt/esp/idf /esp/idf /opt/esp-idf /idf "$HOME/esp/esp-idf"; do
             if [ -f "$p/export.sh" ]; then IDF_DIR="$p"; break; fi
           done
-          if [ -z "$IDF_DIR" ]; then
-            echo "!! export.sh not found"; find / -maxdepth 5 -name export.sh 2>/dev/null | head; exit 1
-          fi
-          echo "IDF_DIR=$IDF_DIR"
+          [ -n "$IDF_DIR" ] || { echo "!! export.sh not found"; exit 1; }
           echo "IDF_PATH=$IDF_DIR" >> "$GITHUB_ENV"
           printf '#!/bin/bash\n. %s/export.sh >/dev/null 2>&1\n' "$IDF_DIR" > /opt/idfenv.sh
           chmod +x /opt/idfenv.sh
           . /opt/idfenv.sh
-          {
-            echo "IDF_DIR=$IDF_DIR"
-            echo "idf.py -> $(command -v idf.py)"
-            idf.py --version
-            echo "gcc -> $(command -v riscv32-esp-elf-gcc)"
-          } > /opt/build.log 2>&1
+          { echo "IDF_DIR=$IDF_DIR"; idf.py --version; } > /opt/build.log 2>&1
           cat /opt/build.log
 
       - name: Build
@@ -63,74 +54,78 @@ jobs:
             echo "=== size ==="
             idf.py size
           } >> /opt/build.log 2>&1
-          tail -c 8000 /opt/build.log
+          tail -c 6000 /opt/build.log
 
-      # 用独立临时仓库推送日志，避免 orphan 分支与工作区互相干扰
-      - name: Publish build log
+      - name: Collect binaries
+        id: collect
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          . /opt/idfenv.sh
+          rm -rf /tmp/fwrepo && mkdir -p /tmp/fwrepo && cd /tmp/fwrepo
+          cp "$GITHUB_WORKSPACE/build/bootloader/bootloader.bin"      bootloader.bin
+          cp "$GITHUB_WORKSPACE/build/partition_table/partition-table.bin" partition-table.bin
+          APP=$(ls "$GITHUB_WORKSPACE"/build/*.bin | grep -v -E 'bootloader|partition' | head -1)
+          echo "APP=$APP"
+          cp "$APP" app.bin
+          printf 'bootloader.bin\t0x0\npartition-table.bin\t0x8000\napp.bin\t0x10000\n' > offsets.txt
+          # 大文件分片，保证每个文件都能通过 contents API 取回(<1MB)
+          for f in *.bin; do
+            sz=$(stat -c %s "$f")
+            echo "$f size=$sz"
+            if [ "$sz" -gt 900000 ]; then
+              split -b 700k -d -a 3 "$f" "$f.part-"
+              rm "$f"
+            fi
+          done
+          sha256sum * > SHA256SUMS 2>/dev/null
+          ls -lh
+          echo "--- tree ---"
+          ls
+
+      - name: Publish artifacts to branch
         if: always()
         run: |
           set +e
+          # 1) 日志
           mkdir -p /tmp/logrepo && cd /tmp/logrepo
           rm -rf .git
           git init -q .
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -q -b ci-logs
-          cp /opt/build.log ./build.log
-          ls -lh build.log
+          cp /opt/build.log ./build.log 2>/dev/null || echo "no build log" > build.log
           git add -f build.log
           git commit -q -m "ci-log run ${GITHUB_RUN_ID}"
           git push -f -q https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git ci-logs
-          echo "log published rc=$?"
+          echo "log push rc=$?"
+          # 2) 固件
+          if [ -d /tmp/fwrepo ] && [ -n "$(ls -A /tmp/fwrepo)" ]; then
+            cd /tmp/fwrepo
+            rm -rf .git
+            git init -q .
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -q -b firmware
+            git add -f .
+            git commit -q -m "firmware ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
+            git push -f -q https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git firmware
+            echo "firmware push rc=$?"
+          else
+            echo "no firmware dir"
+          fi
+
+      - name: Upload raw binaries (Artifact)
+        if: steps.collect.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32c6-test-fw-raw
+          path: /tmp/fwrepo
+          if-no-files-found: warn
 
       - name: Fail if build failed
         if: steps.build.outcome == 'failure'
         run: |
           echo "BUILD FAILED"
           exit 1
-
-      - name: Merge into single flash image
-        run: |
-          set -e
-          . /opt/idfenv.sh
-          cd build
-          APP=$(ls *.bin | grep -v -E 'bootloader|partition' | head -1)
-          echo "app = $APP"
-          esptool.py --chip esp32c6 merge-bin \
-            --flash_mode dio --flash_freq 80m --flash_size 4MB \
-            -o ../esp32c6-test-fw-merged.bin \
-            0x0    bootloader/bootloader.bin \
-            0x8000 partition_table/partition-table.bin \
-            0x10000 "$APP"
-          cd ..
-          ls -lh esp32c6-test-fw-merged.bin
-          sha256sum esp32c6-test-fw-merged.bin
-
-      - name: Upload merged firmware (Artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: esp32c6-test-fw-merged
-          path: esp32c6-test-fw-merged.bin
-          if-no-files-found: error
-
-      - name: Publish firmware to branch
-        run: |
-          set -e
-          mkdir -p /tmp/fwrepo && cd /tmp/fwrepo
-          rm -rf .git fw
-          git init -q .
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -q -b firmware
-          mkdir -p fw && cd fw
-          cp "$GITHUB_WORKSPACE/esp32c6-test-fw-merged.bin" firmware.bin
-          sha256sum firmware.bin > SHA256SUMS
-          stat -c '%s' firmware.bin > SIZE
-          split -b 700k -d -a 3 firmware.bin firmware.bin.part-
-          rm firmware.bin
-          ls -lh
-          cd ..
-          git add -f fw
-          git commit -q -m "firmware ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
-          git push -f -q https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git firmware
-          echo "firmware published"
