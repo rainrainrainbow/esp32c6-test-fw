@@ -70,7 +70,6 @@ jobs:
           echo "APP=$APP"
           cp "$APP" app.bin
           printf 'bootloader.bin\t0x0\npartition-table.bin\t0x8000\napp.bin\t0x10000\n' > offsets.txt
-          # 大文件分片，保证每个文件都能通过 contents API 取回(<1MB)
           for f in *.bin; do
             sz=$(stat -c %s "$f")
             echo "$f size=$sz"
@@ -81,40 +80,23 @@ jobs:
           done
           sha256sum * > SHA256SUMS 2>/dev/null
           ls -lh
-          echo "--- tree ---"
-          ls
 
-      - name: Publish artifacts to branch
+      - name: Publish via Git Data API
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set +e
-          # 1) 日志
-          mkdir -p /tmp/logrepo && cd /tmp/logrepo
-          rm -rf .git
-          git init -q .
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -q -b ci-logs
-          cp /opt/build.log ./build.log 2>/dev/null || echo "no build log" > build.log
-          git add -f build.log
-          git commit -q -m "ci-log run ${GITHUB_RUN_ID}"
-          git push -f -q https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git ci-logs
-          echo "log push rc=$?"
-          # 2) 固件
-          if [ -d /tmp/fwrepo ] && [ -n "$(ls -A /tmp/fwrepo)" ]; then
-            cd /tmp/fwrepo
-            rm -rf .git
-            git init -q .
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git checkout -q -b firmware
-            git add -f .
-            git commit -q -m "firmware ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
-            git push -f -q https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git firmware
-            echo "firmware push rc=$?"
-          else
-            echo "no firmware dir"
-          fi
+          mkdir -p /tmp/logdir
+          cp /opt/build.log /tmp/logdir/build.log 2>/dev/null || echo "no log" > /tmp/logdir/build.log
+          # 先推固件（错误会写进 build.log），再推日志
+          python3 ci_publish.py firmware /tmp/fwrepo >> /opt/build.log 2>&1 || \
+            echo "firmware publish FAILED" >> /opt/build.log
+          cp /opt/build.log /tmp/logdir/build.log
+          python3 ci_publish.py ci-logs /tmp/logdir >> /opt/build.log 2>&1 || \
+            echo "log publish FAILED" >> /opt/build.log
+          echo "publish stage done"
 
       - name: Upload raw binaries (Artifact)
         if: steps.collect.outcome == 'success'
