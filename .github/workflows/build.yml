@@ -13,7 +13,6 @@ jobs:
   build:
     name: Build & merge (ESP-IDF v5.4 / esp32c6)
     runs-on: ubuntu-latest
-    # 需要写权限才能把产物推到 firmware 分支
     permissions:
       contents: write
     container:
@@ -22,16 +21,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set target
-        run: idf.py set-target esp32c6
+      # 容器内 uid 与 checkout 属主不一致，git 会报 dubious ownership，
+      # 而 idf.py 内部会调用 git describe —— 必须先放行，否则直接失败
+      - name: Trust workspace for git
+        run: |
+          git config --global --add safe.directory '*'
+          git config --global --add safe.directory /__w
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "safe.directory ok"
+          git --version
 
+      - name: Show environment
+        run: |
+          echo "IDF_PATH=$IDF_PATH"
+          idf.py --version
+          echo "CONFIG target file:"
+          cat sdkconfig.defaults || true
+
+      # 直接在 build 阶段生成 sdkconfig（sdkconfig.defaults 已指定 esp32c6），
+      # 不再单独跑 set-target，少一个失败点
       - name: Build
-        run: idf.py build
+        id: build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          idf.py build 2>&1 | tee build.log
+
+      - name: Publish build log (for remote inspection)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
+          git checkout --orphan ci-logs
+          git rm -rf . --quiet || true
+          cp /__w/esp32c6-test-fw/esp32c6-test-fw/build.log . 2>/dev/null || \
+            cp "$GITHUB_WORKSPACE/build.log" . 2>/dev/null || echo "no build.log"
+          ls -lh build.log 2>/dev/null || true
+          git add -f build.log 2>/dev/null || true
+          git commit -q -m "ci-log run ${GITHUB_RUN_ID}" || echo "nothing to commit"
+          git push -f origin ci-logs || echo "push failed"
+
+      - name: Fail if build failed
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "BUILD FAILED"
+          exit 1
 
       - name: Size report
         run: idf.py size
 
-      # 合成「从 0x0 直接烧」的整包：bootloader + 分区表 + 应用
       - name: Merge into single flash image
         run: |
           cd build
@@ -54,12 +92,12 @@ jobs:
           path: esp32c6-test-fw-merged.bin
           if-no-files-found: error
 
-      # 把固件推到独立的 orphan 分支，便于通过 API 分片取回
       - name: Publish firmware to orphan branch
         run: |
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
           git checkout --orphan firmware
           git rm -rf . --quiet || true
           rm -rf .github main build CMakeLists.txt README.md sdkconfig.defaults
@@ -72,6 +110,6 @@ jobs:
           ls -lh
           cd ..
           git add -f fw
-          git commit -m "firmware: ${GITHUB_SHA} (${GITHUB_RUN_ID})"
+          git commit -q -m "firmware: ${GITHUB_SHA} (run ${GITHUB_RUN_ID})"
           git push -f origin firmware
           echo "published"
