@@ -21,8 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Actions 的 container: 会绕过镜像 entrypoint，export.sh 不会自动加载，
-      # 必须显式探测 IDF 安装位置并生成可复用的环境脚本
+      # Actions 的 container: 会绕过镜像 entrypoint，export.sh 不会自动加载
       - name: Setup IDF environment
         run: |
           set -e
@@ -33,10 +32,7 @@ jobs:
             if [ -f "$p/export.sh" ]; then IDF_DIR="$p"; break; fi
           done
           if [ -z "$IDF_DIR" ]; then
-            echo "!! export.sh not found, searching..."
-            find / -maxdepth 5 -name export.sh 2>/dev/null | head -10 || true
-            echo "!! IDF_PATH=$IDF_PATH ; PATH=$PATH"
-            exit 1
+            echo "!! export.sh not found"; find / -maxdepth 5 -name export.sh 2>/dev/null | head; exit 1
           fi
           echo "IDF_DIR=$IDF_DIR"
           echo "IDF_PATH=$IDF_DIR" >> "$GITHUB_ENV"
@@ -44,38 +40,48 @@ jobs:
           chmod +x /opt/idfenv.sh
           . /opt/idfenv.sh
           {
-            echo "--- env ---"
             echo "IDF_DIR=$IDF_DIR"
             echo "idf.py -> $(command -v idf.py)"
             idf.py --version
-            echo "riscv gcc -> $(command -v riscv32-esp-elf-gcc)"
-          } 2>&1 | tee build.log
+            echo "gcc -> $(command -v riscv32-esp-elf-gcc)"
+          } > /opt/build.log 2>&1
+          cat /opt/build.log
 
       - name: Build
         id: build
         continue-on-error: true
         run: |
-          set -o pipefail
+          set +e
           . /opt/idfenv.sh
           {
+            echo "=== set-target ==="
             idf.py set-target esp32c6
+            echo "set-target rc=$?"
+            echo "=== build ==="
             idf.py build
+            echo "build rc=$?"
+            echo "=== size ==="
             idf.py size
-          } 2>&1 | tee -a build.log
+          } >> /opt/build.log 2>&1
+          tail -c 8000 /opt/build.log
 
+      # 用独立临时仓库推送日志，避免 orphan 分支与工作区互相干扰
       - name: Publish build log
         if: always()
         run: |
+          set +e
+          mkdir -p /tmp/logrepo && cd /tmp/logrepo
+          rm -rf .git
+          git init -q .
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global --add safe.directory '*'
-          git checkout --orphan ci-logs
-          git rm -rf . --quiet || true
-          cp "$GITHUB_WORKSPACE/build.log" ./build.log 2>/dev/null || echo "no build.log"
-          ls -lh build.log 2>/dev/null || true
-          git add -f build.log 2>/dev/null || true
-          git commit -q -m "ci-log run ${GITHUB_RUN_ID}" || echo "nothing to commit"
-          git push -f origin ci-logs || echo "push failed"
+          git checkout -q -b ci-logs
+          cp /opt/build.log ./build.log
+          ls -lh build.log
+          git add -f build.log
+          git commit -q -m "ci-log run ${GITHUB_RUN_ID}"
+          git push -f -q https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git ci-logs
+          echo "log published rc=$?"
 
       - name: Fail if build failed
         if: steps.build.outcome == 'failure'
@@ -107,24 +113,24 @@ jobs:
           path: esp32c6-test-fw-merged.bin
           if-no-files-found: error
 
-      - name: Publish firmware to orphan branch
+      - name: Publish firmware to branch
         run: |
           set -e
+          mkdir -p /tmp/fwrepo && cd /tmp/fwrepo
+          rm -rf .git fw
+          git init -q .
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global --add safe.directory '*'
-          git checkout --orphan firmware
-          git rm -rf . --quiet || true
-          rm -rf .github main build CMakeLists.txt README.md sdkconfig.defaults
-          mkdir -p fw
-          cp esp32c6-test-fw-merged.bin fw/firmware.bin
-          cd fw
+          git checkout -q -b firmware
+          mkdir -p fw && cd fw
+          cp "$GITHUB_WORKSPACE/esp32c6-test-fw-merged.bin" firmware.bin
+          sha256sum firmware.bin > SHA256SUMS
+          stat -c '%s' firmware.bin > SIZE
           split -b 700k -d -a 3 firmware.bin firmware.bin.part-
           rm firmware.bin
-          sha256sum firmware.bin.part-* > SHA256SUMS
           ls -lh
           cd ..
           git add -f fw
-          git commit -q -m "firmware: ${GITHUB_SHA} (run ${GITHUB_RUN_ID})"
-          git push -f origin firmware
-          echo "published"
+          git commit -q -m "firmware ${GITHUB_SHA} run ${GITHUB_RUN_ID}"
+          git push -f -q https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git firmware
+          echo "firmware published"
