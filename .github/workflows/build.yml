@@ -21,41 +21,57 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 容器内 uid 与 checkout 属主不一致，git 会报 dubious ownership，
-      # 而 idf.py 内部会调用 git describe —— 必须先放行，否则直接失败
-      - name: Trust workspace for git
+      # Actions 的 container: 会绕过镜像 entrypoint，export.sh 不会自动加载，
+      # 必须显式探测 IDF 安装位置并生成可复用的环境脚本
+      - name: Setup IDF environment
         run: |
+          set -e
           git config --global --add safe.directory '*'
-          git config --global --add safe.directory /__w
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          echo "safe.directory ok"
-          git --version
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          IDF_DIR=""
+          for p in /opt/esp/idf /esp/idf /opt/esp-idf /idf "$HOME/esp/esp-idf"; do
+            if [ -f "$p/export.sh" ]; then IDF_DIR="$p"; break; fi
+          done
+          if [ -z "$IDF_DIR" ]; then
+            echo "!! export.sh not found, searching..."
+            find / -maxdepth 5 -name export.sh 2>/dev/null | head -10 || true
+            echo "!! IDF_PATH=$IDF_PATH ; PATH=$PATH"
+            exit 1
+          fi
+          echo "IDF_DIR=$IDF_DIR"
+          echo "IDF_PATH=$IDF_DIR" >> "$GITHUB_ENV"
+          printf '#!/bin/bash\n. %s/export.sh >/dev/null 2>&1\n' "$IDF_DIR" > /opt/idfenv.sh
+          chmod +x /opt/idfenv.sh
+          . /opt/idfenv.sh
+          {
+            echo "--- env ---"
+            echo "IDF_DIR=$IDF_DIR"
+            echo "idf.py -> $(command -v idf.py)"
+            idf.py --version
+            echo "riscv gcc -> $(command -v riscv32-esp-elf-gcc)"
+          } 2>&1 | tee build.log
 
-      - name: Show environment
-        run: |
-          echo "IDF_PATH=$IDF_PATH"
-          idf.py --version
-          echo "CONFIG target file:"
-          cat sdkconfig.defaults || true
-
-      # 直接在 build 阶段生成 sdkconfig（sdkconfig.defaults 已指定 esp32c6），
-      # 不再单独跑 set-target，少一个失败点
       - name: Build
         id: build
         continue-on-error: true
         run: |
           set -o pipefail
-          idf.py build 2>&1 | tee build.log
+          . /opt/idfenv.sh
+          {
+            idf.py set-target esp32c6
+            idf.py build
+            idf.py size
+          } 2>&1 | tee -a build.log
 
-      - name: Publish build log (for remote inspection)
+      - name: Publish build log
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory '*'
           git checkout --orphan ci-logs
           git rm -rf . --quiet || true
-          cp /__w/esp32c6-test-fw/esp32c6-test-fw/build.log . 2>/dev/null || \
-            cp "$GITHUB_WORKSPACE/build.log" . 2>/dev/null || echo "no build.log"
+          cp "$GITHUB_WORKSPACE/build.log" ./build.log 2>/dev/null || echo "no build.log"
           ls -lh build.log 2>/dev/null || true
           git add -f build.log 2>/dev/null || true
           git commit -q -m "ci-log run ${GITHUB_RUN_ID}" || echo "nothing to commit"
@@ -67,11 +83,10 @@ jobs:
           echo "BUILD FAILED"
           exit 1
 
-      - name: Size report
-        run: idf.py size
-
       - name: Merge into single flash image
         run: |
+          set -e
+          . /opt/idfenv.sh
           cd build
           APP=$(ls *.bin | grep -v -E 'bootloader|partition' | head -1)
           echo "app = $APP"
