@@ -1,0 +1,5 @@
+--- env ---
+IDF_DIR=/opt/esp/idf
+idf.py -> /opt/esp/idf/tools/idf.py
+ESP-IDF v5.4.4-1529-gb8874511068
+riscv gcc -> /opt/esp/tools/riscv32-esp-elf/esp-14.2.0_20260121/riscv32-esp-elf/bin/riscv32-esp-elf-gcc
