@@ -45,6 +45,12 @@ jobs:
           set +e
           . /opt/idfenv.sh
           {
+            echo "=== driver headers diag ==="
+            ls /opt/esp/idf/components 2>/dev/null | grep -i -E 'driver' || true
+            find /opt/esp/idf/components -maxdepth 4 -name 'i2c.h'       2>/dev/null | head -5
+            find /opt/esp/idf/components -maxdepth 4 -name 'i2s_std.h'   2>/dev/null | head -5
+            find /opt/esp/idf/components -maxdepth 4 -name 'spi_master.h' 2>/dev/null | head -5
+            find /opt/esp/idf/components -maxdepth 4 -name 'ledc.h'      2>/dev/null | head -5
             echo "=== set-target ==="
             idf.py set-target esp32c6
             echo "set-target rc=$?"
@@ -53,8 +59,16 @@ jobs:
             echo "build rc=$?"
             echo "=== size ==="
             idf.py size
+            echo "size rc=$?"
           } >> /opt/build.log 2>&1
-          tail -c 6000 /opt/build.log
+          tail -c 8000 /opt/build.log
+          # 显式判定：set +e 会让 tail 的退出码掩盖真实构建结果
+          if grep -q "^build rc=0" /opt/build.log; then
+            echo "BUILD_RESULT=OK"
+          else
+            echo "BUILD_RESULT=FAILED"
+            exit 1
+          fi
 
       - name: Collect binaries
         id: collect
